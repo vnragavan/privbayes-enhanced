@@ -9,19 +9,19 @@ Enhanced PrivBayes includes privacy audit tools and advanced privacy metrics for
 Quasi-Identifier (QI) linkage attacks occur when an attacker uses publicly available information (like age, zipcode, gender) to match synthetic records to real individuals.
 
 Metrics computed:
-- **Exact QI Match Rate**: Percentage of synthetic QI combinations that exist in real data
-- **K-Anonymity Violations**: Number of QI combinations with ≤k matches in real data
-- **Linkage Risk Rate**: Percentage of risky QI combinations (low frequency in real data)
-- **QI Combination Statistics**: Unique combinations in real vs synthetic data
+- **Exact QI Match Rate**: Percentage of synthetic QI combinations that exist in real data - **Lower is better** (fewer matches = better privacy)
+- **K-Anonymity Violations**: Number of QI combinations with ≤k matches in real data - **Lower is better** (fewer violations = better k-anonymity)
+- **Linkage Risk Rate**: Percentage of risky QI combinations (low frequency in real data) - **Lower is better** (lower risk = better privacy)
+- **QI Combination Statistics**: Unique combinations in real vs synthetic data - **Closer match is better**
 
 ### Inference Attack Risk Metrics
 
 Inference attacks occur when an attacker tries to infer sensitive attributes (like income, disease status) from quasi-identifiers.
 
 Metrics computed:
-- **Unique Inference Rate**: Percentage of QI combinations that uniquely determine sensitive values
-- **Distribution Error**: KL divergence between real and synthetic conditional distributions
-- **Per-Column Analysis**: Risk assessment for each sensitive column
+- **Unique Inference Rate**: Percentage of QI combinations that uniquely determine sensitive values - **Lower is better** (fewer unique inferences = better privacy)
+- **Distribution Error**: KL divergence between real and synthetic conditional distributions - **Lower is better** (closer to 0 = better preservation)
+- **Per-Column Analysis**: Risk assessment for each sensitive column - **Lower risk is better**
 
 ### DP Compliance Audit
 
@@ -135,10 +135,10 @@ privbayes data/adult.csv -o synthetic.csv --epsilon 1.0 \
 }
 ```
 
-**Interpretation**:
-- **Exact QI Match Rate < 0.5**: Good (fewer exact matches)
-- **K-Anonymity Violation Rate < 0.2**: Good (most combinations have k+ matches)
-- **Linkage Risk Rate < 0.1**: Good (few risky combinations)
+**Interpretation** (all metrics: **Lower is better**):
+- **Exact QI Match Rate < 0.5**: Good (fewer exact matches = better privacy)
+- **K-Anonymity Violation Rate < 0.2**: Good (most combinations have k+ matches = better k-anonymity)
+- **Linkage Risk Rate < 0.1**: Good (few risky combinations = lower linkage attack risk)
 
 ### Inference Attack Risk Metrics
 
@@ -158,9 +158,9 @@ privbayes data/adult.csv -o synthetic.csv --epsilon 1.0 \
 }
 ```
 
-**Interpretation**:
-- **Unique Inference Rate < 0.2**: Good (few unique inferences possible)
-- **Distribution Error < 0.1**: Good (similar conditional distributions)
+**Interpretation** (all metrics: **Lower is better**):
+- **Unique Inference Rate < 0.2**: Good (few unique inferences possible = better privacy)
+- **Distribution Error < 0.1**: Good (similar conditional distributions = better utility preservation)
 
 ### DP Compliance Audit
 
@@ -219,13 +219,11 @@ QI Combination Statistics:
 
 K-Anonymity Analysis (k=5):
   K-anonymity violations: 18
-  Violation rate: 0.1500
-    (Lower is better - indicates better k-anonymity protection)
+  Violation rate: 0.1500 (Lower is better - indicates better k-anonymity protection)
 
 Linkage Risk:
   Risky QI combinations: 12
-  Linkage risk rate: 0.1000
-    (Lower is better - indicates lower linkage attack risk)
+  Linkage risk rate: 0.1000 (Lower is better - indicates lower linkage attack risk)
 
 ================================================================================
 ```
@@ -240,8 +238,7 @@ Inference Attack Risk Report
 Sensitive Columns: income
 QI Columns: age, sex, race
 
-Average Unique Inference Rate: 0.1200
-  (Lower is better - indicates lower inference attack risk)
+Average Unique Inference Rate: 0.1200 (Lower is better - indicates lower inference attack risk)
 
 Per-Column Inference Risks:
 

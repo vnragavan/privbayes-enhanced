@@ -22,28 +22,28 @@ The privacy metrics are computed by the `privacy_report()` method and include:
 The utility metrics compare real and synthetic data to assess data quality:
 
 1. **Numeric Statistics**:
-   - Mean error (relative)
-   - Standard deviation error (relative)
-   - Median error (relative)
-   - Range preservation (min/max)
+   - Mean error (relative) - **Lower is better** (closer to 0)
+   - Standard deviation error (relative) - **Lower is better** (closer to 0)
+   - Median error (relative) - **Lower is better** (closer to 0)
+   - Range preservation (min/max) - **Higher is better** (True = preserved)
    - **Marginal Distributional Errors**:
-     - Kolmogorov-Smirnov statistic (0 = identical, 1 = completely different)
-     - Wasserstein distance (Earth Mover's Distance)
-     - Jensen-Shannon divergence on binned data
+     - Kolmogorov-Smirnov statistic - **Lower is better** (0 = identical, 1 = completely different)
+     - Wasserstein distance (Earth Mover's Distance) - **Lower is better** (0 = identical)
+     - Jensen-Shannon divergence on binned data - **Lower is better** (0 = identical, 1 = completely different)
 
 2. **Categorical Similarity**:
-   - Jensen-Shannon divergence (0 = identical, 1 = completely different)
-   - Total Variation Distance (0 = identical, 1 = completely different)
-   - Coverage (percentage of real categories present in synthetic data)
-   - Unique value counts
+   - Jensen-Shannon divergence - **Lower is better** (0 = identical, 1 = completely different)
+   - Total Variation Distance - **Lower is better** (0 = identical, 1 = completely different)
+   - Coverage (percentage of real categories present in synthetic data) - **Higher is better** (1.0 = all categories preserved)
+   - Unique value counts - **Closer to real count is better**
 
 3. **Correlation Preservation**:
-   - Correlation of correlations (how well pairwise correlations are preserved)
-   - Mean absolute error of correlations
+   - Correlation of correlations - **Higher is better** (1.0 = perfect preservation, 0 = no preservation)
+   - Mean absolute error of correlations - **Lower is better** (closer to 0)
 
 4. **Privacy Heuristics**:
-   - Exact match rate (lower is better)
-   - UNK token rate
+   - Exact match rate - **Lower is better** (fewer exact copies = better privacy)
+   - UNK token rate - **Lower is better** (fewer UNK tokens = better utility)
 
 ## Usage
 
@@ -185,19 +185,19 @@ privbayes data/adult.csv -o synthetic.csv --epsilon 1.0 \
 
 ### Utility Metrics
 
-- **Mean/Std Error < 0.1**: Good preservation of statistics
-- **Kolmogorov-Smirnov Statistic < 0.2**: Good numeric distribution similarity
-- **Wasserstein Distance**: Lower is better (depends on data scale)
-- **Jensen-Shannon Divergence < 0.2**: Good distribution similarity (both numeric and categorical)
-- **Total Variation Distance < 0.2**: Good categorical distribution similarity
-- **Coverage > 0.9**: Most categories preserved
-- **Correlation of Correlations > 0.8**: Good correlation preservation
+- **Mean/Std Error < 0.1**: Good preservation of statistics (**Lower is better**, closer to 0)
+- **Kolmogorov-Smirnov Statistic < 0.2**: Good numeric distribution similarity (**Lower is better**, 0 = identical)
+- **Wasserstein Distance**: Good when small relative to data scale (**Lower is better**, 0 = identical)
+- **Jensen-Shannon Divergence < 0.2**: Good distribution similarity (**Lower is better**, 0 = identical, 1 = completely different)
+- **Total Variation Distance < 0.2**: Good categorical distribution similarity (**Lower is better**, 0 = identical, 1 = completely different)
+- **Coverage > 0.9**: Most categories preserved (**Higher is better**, 1.0 = all categories present)
+- **Correlation of Correlations > 0.8**: Good correlation preservation (**Higher is better**, 1.0 = perfect preservation)
 
 ### Privacy Metrics
 
-- **Exact Match Rate < 0.01**: Very few exact copies (good for privacy)
-- **UNK Token Rate**: Lower is better (indicates better category discovery)
-- **Epsilon**: Lower values provide stronger privacy guarantees
+- **Exact Match Rate < 0.01**: Very few exact copies (**Lower is better** for privacy)
+- **UNK Token Rate**: Better category discovery (**Lower is better** for utility)
+- **Epsilon**: Privacy budget (**Lower is better** for privacy, but may reduce utility)
 
 ## Example Output
 
@@ -213,33 +213,31 @@ Dataset Summary:
   Categorical columns: 9
 
 Marginal Distributional Errors (Per Column):
-  Average KS statistic (numeric): 0.1234 (0=identical, 1=different)
-  Average Wasserstein distance (numeric): 5.23
-  Average JSD (categorical): 0.1234 (0=identical, 1=different)
+  Average KS statistic (numeric): 0.1234 (Lower is better, 0=identical, 1=different)
+  Average Wasserstein distance (numeric): 5.23 (Lower is better, 0=identical)
+  Average JSD (categorical): 0.1234 (Lower is better, 0=identical, 1=different)
 
 Numeric Column Statistics:
-  Average mean error: 0.0234
-  Average std error: 0.0456
-  Average KS statistic: 0.1234
-  Average Wasserstein distance: 5.23
+  Average mean error: 0.0234 (Lower is better, closer to 0)
+  Average std error: 0.0456 (Lower is better, closer to 0)
+  Average KS statistic: 0.1234 (Lower is better, 0=identical)
+  Average Wasserstein distance: 5.23 (Lower is better, 0=identical)
 
   age:
-    Mean error: 0.0021
-    Std error: 0.0123
+    Mean error: 0.0021 (Lower is better, closer to 0)
+    Std error: 0.0123 (Lower is better, closer to 0)
     Real mean: 38.44, Synthetic mean: 38.52
-    KS statistic: 0.1234 (p=0.05)
-    Wasserstein distance: 5.23
-    JSD (binned): 0.08
+    KS statistic: 0.1234 (p=0.05) (Lower is better, 0 = identical)
+    Wasserstein distance: 5.23 (Lower is better, 0 = identical)
+    JSD (binned): 0.08 (Lower is better, 0 = identical)
 
 Categorical Distribution Similarity:
-  Average Jensen-Shannon divergence: 0.1234
-    (0 = identical, 1 = completely different)
-  Average coverage: 95.23%
+  Average Jensen-Shannon divergence: 0.1234 (Lower is better, 0 = identical, 1 = completely different)
+  Average coverage: 95.23% (Higher is better, 100% = all categories preserved)
 
 Correlation Preservation:
-  Correlation of correlations: 0.8912
-    (1.0 = perfect preservation, 0 = no preservation)
-  Mean absolute error: 0.0456
+  Correlation of correlations: 0.8912 (Higher is better, 1.0 = perfect preservation)
+  Mean absolute error: 0.0456 (Lower is better, closer to 0)
 
 ================================================================================
 Privacy Metrics Report

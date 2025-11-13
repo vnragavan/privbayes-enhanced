@@ -18,22 +18,22 @@ Downstream metrics answer the question: **"Can I train a model on synthetic data
 
 ### For Classification Tasks
 
-- **Accuracy**: Percentage of correct predictions
-- **F1-Score**: Harmonic mean of precision and recall (weighted average for multi-class)
-- **ROC-AUC**: Area under the ROC curve (binary classification only)
-- **Performance Gap**: Difference in accuracy between real and synthetic training
+- **Accuracy**: Percentage of correct predictions - **Higher is better** (1.0 = perfect)
+- **F1-Score**: Harmonic mean of precision and recall (weighted average for multi-class) - **Higher is better** (1.0 = perfect)
+- **ROC-AUC**: Area under the ROC curve (binary classification only) - **Higher is better** (1.0 = perfect)
+- **Performance Gap**: Difference in accuracy between real and synthetic training - **Lower is better** (closer to 0)
 
 ### For Regression Tasks
 
-- **MSE (Mean Squared Error)**: Average squared prediction error
-- **MAE (Mean Absolute Error)**: Average absolute prediction error
-- **R² Score**: Coefficient of determination (1.0 = perfect, 0 = baseline)
-- **Performance Gap**: Difference in R² score between real and synthetic training
+- **MSE (Mean Squared Error)**: Average squared prediction error - **Lower is better** (closer to 0)
+- **MAE (Mean Absolute Error)**: Average absolute prediction error - **Lower is better** (closer to 0)
+- **R² Score**: Coefficient of determination - **Higher is better** (1.0 = perfect, 0 = baseline)
+- **Performance Gap**: Difference in R² score between real and synthetic training - **Lower is better** (closer to 0)
 
 ### Feature Importance
 
-- **Cosine Similarity**: How similar are feature importances between real and synthetic models
-- **Top Features**: Which features are most important in each model
+- **Cosine Similarity**: How similar are feature importances between real and synthetic models - **Higher is better** (1.0 = identical)
+- **Top Features**: Which features are most important in each model - **Should match between real and synthetic**
 
 ## Usage
 
@@ -86,34 +86,32 @@ Model Performance Comparison
 
 RandomForest:
   Real Data Performance:
-    accuracy: 0.8523
-    f1_score: 0.8412
-    roc_auc: 0.9123
+    accuracy: 0.8523 (Higher is better, 1.0 = perfect)
+    f1_score: 0.8412 (Higher is better, 1.0 = perfect)
+    roc_auc: 0.9123 (Higher is better, 1.0 = perfect)
   Synthetic Data Performance:
-    accuracy: 0.8234
-    f1_score: 0.8123
-    roc_auc: 0.8901
-  Performance Gap: 0.0289 (relative: 3.39%)
-    (Lower gap is better - synthetic data preserves classification patterns)
+    accuracy: 0.8234 (Higher is better, 1.0 = perfect)
+    f1_score: 0.8123 (Higher is better, 1.0 = perfect)
+    roc_auc: 0.8901 (Higher is better, 1.0 = perfect)
+  Performance Gap: 0.0289 (relative: 3.39%) (Lower is better, closer to 0)
 
 LogisticRegression:
   Real Data Performance:
-    accuracy: 0.8234
-    f1_score: 0.8123
-    roc_auc: 0.8901
+    accuracy: 0.8234 (Higher is better, 1.0 = perfect)
+    f1_score: 0.8123 (Higher is better, 1.0 = perfect)
+    roc_auc: 0.8901 (Higher is better, 1.0 = perfect)
   Synthetic Data Performance:
-    accuracy: 0.8012
-    f1_score: 0.7890
-    roc_auc: 0.8723
-  Performance Gap: 0.0222 (relative: 2.70%)
-    (Lower gap is better - synthetic data preserves classification patterns)
+    accuracy: 0.8012 (Higher is better, 1.0 = perfect)
+    f1_score: 0.7890 (Higher is better, 1.0 = perfect)
+    roc_auc: 0.8723 (Higher is better, 1.0 = perfect)
+  Performance Gap: 0.0222 (relative: 2.70%) (Lower is better, closer to 0)
 
 ================================================================================
 Feature Importance Preservation
 ================================================================================
 
 RandomForest:
-  Cosine Similarity: 0.9234 (1.0 = identical, 0 = different)
+  Cosine Similarity: 0.9234 (Higher is better, 1.0 = identical, 0 = different)
 
 ================================================================================
 Summary
@@ -128,17 +126,17 @@ Best Preserving Model: LogisticRegression
 
 ### Performance Gaps
 
-- **< 0.01 (1%)**: Excellent - synthetic data preserves ML patterns very well
-- **0.01 - 0.05 (1-5%)**: Good - synthetic data is usable for ML tasks
-- **0.05 - 0.10 (5-10%)**: Acceptable - some utility loss but still usable
-- **> 0.10 (10%)**: Poor - significant utility loss for ML tasks
+- **< 0.01 (1%)**: Excellent - synthetic data preserves ML patterns very well (**Lower is better**, closer to 0)
+- **0.01 - 0.05 (1-5%)**: Good - synthetic data is usable for ML tasks (**Lower is better**)
+- **0.05 - 0.10 (5-10%)**: Acceptable - some utility loss but still usable (**Lower is better**)
+- **> 0.10 (10%)**: Poor - significant utility loss for ML tasks (**Lower is better**)
 
 ### Feature Importance Similarity
 
-- **> 0.9**: Excellent - same features are important
-- **0.7 - 0.9**: Good - similar feature importance
-- **0.5 - 0.7**: Acceptable - some differences in feature importance
-- **< 0.5**: Poor - different features are important
+- **> 0.9**: Excellent - same features are important (**Higher is better**, 1.0 = identical)
+- **0.7 - 0.9**: Good - similar feature importance (**Higher is better**)
+- **0.5 - 0.7**: Acceptable - some differences in feature importance (**Higher is better**)
+- **< 0.5**: Poor - different features are important (**Higher is better**)
 
 ## Why This Matters
 
