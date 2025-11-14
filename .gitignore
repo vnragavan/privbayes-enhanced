@@ -66,3 +66,5 @@ Thumbs.db
 # Helper/Development files (internal use only)
 ESSENTIAL_FILES.md
 UPLOAD_CHECKLIST.md
+GITHUB_UPLOAD_STEPS.md
+USER_INPUT_NEEDED.md

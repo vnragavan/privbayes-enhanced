@@ -44,6 +44,23 @@ pip install -e .
 
 **Note:** The code works on both Windows and Linux/macOS. All commands are cross-platform except for virtual environment activation.
 
+### Running Without Installation (Windows)
+
+You can also run the code **without installing** the package. See [docs/RUNNING_WITHOUT_INSTALLATION.md](docs/RUNNING_WITHOUT_INSTALLATION.md) for details.
+
+**Quick example:**
+```cmd
+REM Set PYTHONPATH and run
+set PYTHONPATH=%CD% && python -m privbayes_enhanced.cli data\adult.csv -o synthetic.csv --epsilon 1.0
+```
+
+Or use the helper script:
+```cmd
+run_cli.bat data\adult.csv -o synthetic.csv --epsilon 1.0
+```
+
+**Note:** You still need to install dependencies: `pip install -r requirements.txt`
+
 ## Quick Start
 
 ### Command Line

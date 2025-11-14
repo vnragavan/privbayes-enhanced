@@ -467,7 +467,11 @@ class PrivBayesSynthesizerEnhanced:
             # Handle string-formatted datetime columns (common in CSV exports)
             elif df[c].dtype == 'object':
                 try:
-                    dt_parsed = pd.to_datetime(df[c], errors='coerce')
+                    # Suppress format inference warning - parsing still works, just slower
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', category=UserWarning, 
+                                                message='.*Could not infer format.*')
+                        dt_parsed = pd.to_datetime(df[c], errors='coerce')
                     if dt_parsed.notna().mean() >= 0.95:
                         df[c] = dt_parsed.astype('int64')
                 except (ValueError, TypeError, OverflowError):
@@ -690,30 +694,64 @@ class PrivBayesSynthesizerEnhanced:
             if m.kind == "numeric":
                 lo, hi = m.bounds if m.bounds is not None else (0.0, 1.0)
                 x = pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float)
-                z = (x - lo) / max(hi - lo, 1e-12)
-                z = np.where(np.isfinite(z), z, 0.5)
-                z = np.clip(z, 0.0, 1.0)
-                idx = np.digitize(z, m.bins, right=False) - 1
-                idx = np.clip(idx, 0, m.k - 1)
-                out[c] = idx.astype(int, copy=False)
+                
+                # Track NULL values for numeric columns
+                # Add a special bin for NULL (use code = k, which is one beyond the last bin)
+                has_nulls = np.isnan(x).any()
+                if has_nulls:
+                    # Use code k (one beyond last bin) to represent NULL
+                    # We'll need to extend the number of bins by 1 for NULL
+                    null_mask = np.isnan(x)
+                    z = (x - lo) / max(hi - lo, 1e-12)
+                    z = np.where(np.isfinite(z), z, 0.5)
+                    z = np.clip(z, 0.0, 1.0)
+                    idx = np.digitize(z, m.bins, right=False) - 1
+                    idx = np.clip(idx, 0, m.k - 1)
+                    # Mark NULL values with code k (beyond normal bins)
+                    idx = np.where(null_mask, m.k, idx)
+                    out[c] = idx.astype(int, copy=False)
+                else:
+                    z = (x - lo) / max(hi - lo, 1e-12)
+                    z = np.where(np.isfinite(z), z, 0.5)
+                    z = np.clip(z, 0.0, 1.0)
+                    idx = np.digitize(z, m.bins, right=False) - 1
+                    idx = np.clip(idx, 0, m.k - 1)
+                    out[c] = idx.astype(int, copy=False)
             else:
                 unk = getattr(self, "unknown_token", "__UNK__")
                 cats = list(m.cats or [])
+                
+                # Track NULL values - add NULL as a special category if present
+                null_token = "__NULL__"
+                has_nulls = df[c].isna().any()
                 
                 # Non-label categoricals get unknown bucket, unless public_categories provided
                 has_public_cats = c in (self.public_categories or {})
                 if c not in self.label_columns and not has_public_cats:
                     if unk not in cats:
                         cats = [unk] + [x for x in cats if x != unk]
-                        m.cats = cats
+                
+                # Add NULL token if there are NULLs in the data
+                if has_nulls and null_token not in cats:
+                    cats = [null_token] + [x for x in cats if x != null_token]
+                    m.cats = cats
+                    if c in (self.public_categories or {}):
                         self.public_categories[c] = cats
                 
-                col = df[c].astype("string").fillna(unk if c not in self.label_columns else (cats[0] if cats else unk))
+                # Convert to string, but preserve NULLs separately
+                col = df[c].astype("string")
+                # Replace NULL with NULL token (don't use UNK for NULLs)
+                if has_nulls:
+                    col = col.fillna(null_token)
+                else:
+                    # Only use UNK for missing values if no NULLs in training
+                    col = col.fillna(unk if c not in self.label_columns else (cats[0] if cats else unk))
                 
                 # Never hash labels
                 if getattr(m, "hashed_cats", False) and m.hash_m and (c not in self.label_columns):
                     msize = int(m.hash_m)
-                    col = col.map(lambda v: unk if v == unk else f"B{_blake_bucket(str(v), msize):03d}")
+                    # Don't hash NULL token - keep it as is
+                    col = col.map(lambda v: null_token if v == null_token else (unk if v == unk else f"B{_blake_bucket(str(v), msize):03d}"))
                 
                 cat = pd.Categorical(col, categories=cats, ordered=False)
                 codes = np.asarray(cat.codes, dtype=int)
@@ -800,6 +838,15 @@ class PrivBayesSynthesizerEnhanced:
         for c in cols:
             k_child = self._meta[c].k
             pa = parents[c]
+            # For numeric columns, check if NULL codes (code = k) are present
+            # If so, extend CPT to k+1 to include NULL bin
+            has_null_codes = False
+            if self._meta[c].kind == "numeric":
+                disc_codes = disc[c].to_numpy()
+                has_null_codes = (disc_codes >= k_child).any()
+                if has_null_codes:
+                    k_child = k_child + 1  # Add one bin for NULL
+            
             if len(pa) == 0:
                 counts = np.bincount(disc[c].to_numpy(), minlength=k_child).astype(float)
                 if eps_per_var > 0:
@@ -810,12 +857,30 @@ class PrivBayesSynthesizerEnhanced:
                 probs = (counts / counts.sum().clip(min=1e-12)).reshape(1, k_child).astype(self.cpt_dtype)
                 self._cpt[c] = {"parents": [], "parent_card": [], "probs": probs}
             else:
-                par_ks = [self._meta[p].k for p in pa]
+                # For parent columns, check if NULL codes are present and extend cardinality
+                par_ks = []
+                for p in pa:
+                    p_k = self._meta[p].k
+                    # Check if parent has NULL codes (for numeric columns)
+                    if self._meta[p].kind == "numeric":
+                        parent_codes = disc[p].to_numpy()
+                        if (parent_codes >= p_k).any():
+                            p_k = p_k + 1  # Add one for NULL bin
+                    par_ks.append(p_k)
+                
                 S = int(np.prod(par_ks, dtype=object))
                 max_cells = int(2_000_000)
                 while S * k_child > max_cells and len(pa) > 0:
                     pa = pa[:-1]
-                    par_ks = [self._meta[p].k for p in pa]
+                    # Recalculate par_ks for remaining parents
+                    par_ks = []
+                    for p in pa:
+                        p_k = self._meta[p].k
+                        if self._meta[p].kind == "numeric":
+                            parent_codes = disc[p].to_numpy()
+                            if (parent_codes >= p_k).any():
+                                p_k = p_k + 1
+                        par_ks.append(p_k)
                     S = int(np.prod(par_ks, dtype=object))
                 if S * k_child > max_cells:
                     raise MemoryError(f"CPT for {c} too large after pruning.")
@@ -915,11 +980,25 @@ class PrivBayesSynthesizerEnhanced:
             z = codes[c]
             if m.kind == "numeric":
                 lo, hi = m.bounds if m.bounds is not None else (0.0, 1.0)
-                left = m.bins[z]
-                right = m.bins[np.minimum(z + 1, m.k)]
-                u = rng.random(n)
-                val01 = left + (right - left) * u
-                val = lo + val01 * (hi - lo)
+                
+                # Handle NULL values (code = k represents NULL)
+                null_mask = (z >= m.k)
+                if null_mask.any():
+                    # For NULL codes, set to NaN
+                    z_valid = np.clip(z, 0, m.k - 1)  # Clip to valid bin range
+                    left = m.bins[z_valid]
+                    right = m.bins[np.minimum(z_valid + 1, m.k)]
+                    u = rng.random(n)
+                    val01 = left + (right - left) * u
+                    val = lo + val01 * (hi - lo)
+                    # Restore NULLs
+                    val = np.where(null_mask, np.nan, val)
+                else:
+                    left = m.bins[z]
+                    right = m.bins[np.minimum(z + 1, m.k)]
+                    u = rng.random(n)
+                    val01 = left + (right - left) * u
+                    val = lo + val01 * (hi - lo)
                 # Clip to original data bounds if provided
                 # WARNING: original_data_bounds reveals exact data range and is NOT DP-compliant
                 # Only use if bounds are public knowledge (e.g., age is always 0-120)
@@ -960,11 +1039,16 @@ class PrivBayesSynthesizerEnhanced:
                     val = val.astype(float)
                 out[c] = val
             else:
-                # Categorical: keep unknowns as token (no NaNs)
+                # Categorical: map codes to category strings, preserve NULLs
                 unk = getattr(self, "unknown_token", "__UNK__")
+                null_token = "__NULL__"
                 cats = m.cats or [unk]
                 z = np.clip(z, 0, len(cats) - 1)
                 vals = np.array(cats, dtype=object)[z]
+                
+                # Convert NULL token back to actual NULL/NaN
+                if null_token in cats:
+                    vals = np.where(vals == null_token, np.nan, vals)
                 
                 # Legacy behavior (off by default)
                 if getattr(self, "categorical_unknown_to_nan", False):

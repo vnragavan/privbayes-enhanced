@@ -1,6 +1,7 @@
 """High-level adapter for Enhanced PrivBayes."""
 
 from typing import Optional, List
+import warnings
 import pandas as pd
 import numpy as np
 from .synthesizer import PrivBayesSynthesizerEnhanced
@@ -63,24 +64,81 @@ class EnhancedPrivBayesAdapter:
         
         self._fitted = False
         self._real_data = None
+        self._original_columns = None  # Track original column order and names
+        self._datetime_columns = {}  # Track columns that were originally datetime
+        self._datetime_formats = {}  # Track datetime format strings for preservation
+        self._column_constraints = {}  # Track schema constraints: max_length, min_value, max_value
         
-    def fit(self, X: pd.DataFrame, y=None):
+    def fit(self, X: pd.DataFrame, y=None, column_constraints: Optional[dict] = None):
         """Fit the model to data.
         
         Converts datetimes to numeric, coerces numeric strings, then fits the model.
+        
+        Args:
+            X: Training data
+            y: Not used (for sklearn compatibility)
+            column_constraints: Optional dict of {column: {'max_length': int, 'min_value': int, 'max_value': int}}
+                Example: {'Personnummer_slett': {'max_length': 5}, 'PersonId': {'min_value': 0}}
         """
         X2 = X.copy()
+        # Store original column order and names
+        self._original_columns = list(X.columns)
+        self._datetime_columns = {}  # Reset datetime tracking
+        self._datetime_formats = {}  # Reset datetime format tracking
+        self._column_constraints = column_constraints or {}  # Store schema constraints
+        
+        # Auto-detect constraints from data if not provided
+        if not self._column_constraints:
+            self._column_constraints = self._detect_constraints(X)
+        
+        # Set public_bounds for non-negative columns to prevent DP noise from making bounds negative
+        # This is DP-safe because it's public knowledge (e.g., IDs are always >= 0)
+        # Merge with existing public_bounds if any
+        if not hasattr(self.model, 'public_bounds') or self.model.public_bounds is None:
+            self.model.public_bounds = {}
+        
+        for col, constraints in self._column_constraints.items():
+            if 'min_value' in constraints and constraints['min_value'] >= 0:
+                # If column should be non-negative, set public lower bound to 0
+                # This prevents DP noise from making the lower bound negative
+                if col not in self.model.public_bounds:
+                    # Get max from training data or use a reasonable default
+                    if col in X.columns:
+                        max_val = constraints.get('max_value', float(X[col].max()))
+                    else:
+                        max_val = constraints.get('max_value', 1e6)
+                    self.model.public_bounds[col] = [0.0, float(max_val)]
+        
         for c in X2.columns:
             # Convert datetime/timedelta to nanoseconds for processing
             if pd.api.types.is_datetime64_any_dtype(X2[c]):
+                # Store original datetime type
+                self._datetime_columns[c] = 'datetime64[ns]'
+                # Detect format from original data (if it was a string column)
+                if c in X.columns and X[c].dtype == 'object':
+                    # Try to detect format from first non-null value
+                    sample_val = X[c].dropna().iloc[0] if len(X[c].dropna()) > 0 else None
+                    if sample_val is not None:
+                        self._datetime_formats[c] = self._detect_datetime_format(str(sample_val))
                 X2[c] = X2[c].astype('int64')
             elif pd.api.types.is_timedelta64_dtype(X2[c]):
+                # Store original timedelta type
+                self._datetime_columns[c] = 'timedelta64[ns]'
                 X2[c] = X2[c].astype('int64')
             # Try parsing string columns as datetime (handles CSV exports)
             elif X2[c].dtype == 'object':
                 try:
-                    dt_parsed = pd.to_datetime(X2[c], errors='coerce')
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore', category=UserWarning, 
+                                                message='.*Could not infer format.*')
+                        dt_parsed = pd.to_datetime(X2[c], errors='coerce')
                     if dt_parsed.notna().mean() >= 0.95:
+                        # Store that this was a datetime string
+                        self._datetime_columns[c] = 'datetime64[ns]'
+                        # Detect and store the format from original string data
+                        sample_val = X[c].dropna().iloc[0] if len(X[c].dropna()) > 0 else None
+                        if sample_val is not None:
+                            self._datetime_formats[c] = self._detect_datetime_format(str(sample_val))
                         X2[c] = dt_parsed.astype('int64')
                         continue
                 except (ValueError, TypeError, OverflowError):
@@ -106,6 +164,49 @@ class EnhancedPrivBayesAdapter:
         
         # Generate synthetic data
         synthetic_df = self.model.sample(n_samples, seed=self.seed)
+        
+        # Apply schema constraints BEFORE datetime conversion (so we can clip negative timestamps)
+        synthetic_df = self._apply_constraints(synthetic_df)
+        
+        # Convert datetime columns back to readable format (after constraints applied)
+        for col, dtype in self._datetime_columns.items():
+            if col in synthetic_df.columns:
+                if dtype == 'datetime64[ns]':
+                    # Convert nanoseconds (int64) back to datetime
+                    dt_series = pd.to_datetime(synthetic_df[col], errors='coerce')
+                    
+                    # Apply original format if detected
+                    if col in self._datetime_formats:
+                        fmt = self._datetime_formats[col]
+                        if fmt:
+                            # Format as string with original format, then convert back to datetime
+                            # This preserves the format when saved to CSV
+                            synthetic_df[col] = dt_series.dt.strftime(fmt)
+                        else:
+                            synthetic_df[col] = dt_series
+                    else:
+                        synthetic_df[col] = dt_series
+                elif dtype == 'timedelta64[ns]':
+                    # Convert nanoseconds (int64) back to timedelta
+                    synthetic_df[col] = pd.to_timedelta(synthetic_df[col], errors='coerce')
+        
+        # Ensure column order and names match original data exactly
+        if self._original_columns is not None:
+            # Reorder columns to match original order
+            # Add any missing columns (shouldn't happen, but be safe)
+            missing_cols = [col for col in self._original_columns if col not in synthetic_df.columns]
+            if missing_cols:
+                # Fill missing columns with NaN (shouldn't happen in normal operation)
+                for col in missing_cols:
+                    synthetic_df[col] = np.nan
+            
+            # Remove any extra columns (shouldn't happen, but be safe)
+            extra_cols = [col for col in synthetic_df.columns if col not in self._original_columns]
+            if extra_cols:
+                synthetic_df = synthetic_df.drop(columns=extra_cols)
+            
+            # Reorder to match original column order
+            synthetic_df = synthetic_df[self._original_columns]
         
         return synthetic_df
     
@@ -335,5 +436,254 @@ class EnhancedPrivBayesAdapter:
             print_dp_audit_report(audit_results)
         
         return audit_results
+    
+    def _detect_constraints(self, X: pd.DataFrame) -> dict:
+        """Auto-detect constraints from training data.
+        
+        Detects:
+        - String max length for categorical columns
+        - Integer min/max bounds (especially non-negative for IDs)
+        - Integer digit count (max number of digits)
+        - Float decimal places (precision)
+        """
+        constraints = {}
+        
+        for col in X.columns:
+            col_constraints = {}
+            
+            # For string/categorical columns, detect length patterns
+            if X[col].dtype == 'object' or not pd.api.types.is_numeric_dtype(X[col]):
+                # Convert to string and analyze length patterns
+                str_lengths = X[col].astype(str).str.len()
+                str_lengths = str_lengths[str_lengths > 0]  # Exclude empty strings
+                
+                if len(str_lengths) > 0:
+                    min_len = int(str_lengths.min())
+                    max_len = int(str_lengths.max())
+                    
+                    col_constraints['min_length'] = min_len
+                    col_constraints['max_length'] = max_len
+                    
+                    # If all values have the same length, it's a fixed-length column (like char(n))
+                    if min_len == max_len:
+                        col_constraints['fixed_length'] = min_len
+                    
+                    # Detect if values are mostly the same length (e.g., 95%+ have same length)
+                    length_counts = str_lengths.value_counts()
+                    most_common_length = length_counts.idxmax()
+                    most_common_count = length_counts.max()
+                    if most_common_count / len(str_lengths) >= 0.95:
+                        # Most values have the same length - treat as preferred length
+                        col_constraints['preferred_length'] = int(most_common_length)
+            
+            # For integer columns, detect bounds, digit count, and check if non-negative
+            elif pd.api.types.is_integer_dtype(X[col]):
+                numeric_vals = pd.to_numeric(X[col], errors='coerce')
+                numeric_vals = numeric_vals[numeric_vals.notna()]
+                
+                if len(numeric_vals) > 0:
+                    min_val = int(numeric_vals.min())
+                    max_val = int(numeric_vals.max())
+                    
+                    # If all values are non-negative, set min_value to 0
+                    if min_val >= 0:
+                        col_constraints['min_value'] = 0
+                    else:
+                        col_constraints['min_value'] = min_val
+                    
+                    col_constraints['max_value'] = max_val
+                    
+                    # Detect max number of digits (for integer precision)
+                    # Count digits in all non-null integer values
+                    int_vals = numeric_vals.astype(int)
+                    digit_counts = [len(str(abs(v))) for v in int_vals if pd.notna(v)]
+                    if digit_counts:
+                        max_digits = max(digit_counts)
+                        col_constraints['max_digits'] = max_digits
+            
+            # For numeric (float) columns, detect decimal places and non-negative
+            elif pd.api.types.is_numeric_dtype(X[col]):
+                numeric_vals = pd.to_numeric(X[col], errors='coerce')
+                numeric_vals = numeric_vals[numeric_vals.notna()]
+                
+                if len(numeric_vals) > 0:
+                    min_val = float(numeric_vals.min())
+                    # If all values are non-negative, set min_value to 0
+                    if min_val >= 0:
+                        col_constraints['min_value'] = 0
+                    
+                    # Detect decimal places (precision)
+                    # Convert to string and count decimal places
+                    decimal_places = []
+                    for v in numeric_vals:
+                        if pd.notna(v):
+                            v_str = str(v)
+                            if '.' in v_str:
+                                # Count digits after decimal point
+                                dec_part = v_str.split('.')[1]
+                                # Remove scientific notation (e.g., '1e-5')
+                                if 'e' in dec_part.lower():
+                                    continue
+                                decimal_places.append(len(dec_part))
+                            else:
+                                decimal_places.append(0)
+                    
+                    if decimal_places:
+                        max_decimal_places = max(decimal_places)
+                        # Only track if there's consistent precision (at least 50% have same precision)
+                        if max_decimal_places > 0:
+                            col_constraints['decimal_places'] = max_decimal_places
+            
+            if col_constraints:
+                constraints[col] = col_constraints
+        
+        return constraints
+    
+    def _apply_constraints(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply schema constraints to synthetic data.
+        
+        Enforces:
+        - String max length (truncates or pads)
+        - Integer min/max bounds (clips values)
+        - Non-negative values for ID columns
+        - Integer digit count (max digits)
+        - Float decimal places (precision)
+        """
+        df = df.copy()
+        
+        for col, constraints in self._column_constraints.items():
+            if col not in df.columns:
+                continue
+            
+            # Apply string length constraints for categorical columns
+            if df[col].dtype == 'object' or not pd.api.types.is_numeric_dtype(df[col]):
+                # Handle fixed-length columns (like char(n))
+                if 'fixed_length' in constraints:
+                    fixed_len = constraints['fixed_length']
+                    # Pad or truncate to exact length
+                    df[col] = df[col].astype(str).str[:fixed_len].str.ljust(fixed_len, ' ')
+                
+                # Handle preferred length (most values have same length)
+                elif 'preferred_length' in constraints:
+                    preferred_len = constraints['preferred_length']
+                    min_len = constraints.get('min_length', 0)
+                    max_len = constraints.get('max_length', preferred_len)
+                    # Truncate if too long, pad if too short (within min-max range)
+                    df[col] = df[col].astype(str)
+                    df[col] = df[col].str[:max_len]
+                    # Pad to preferred length if shorter than min
+                    if min_len > 0:
+                        df[col] = df[col].str.ljust(min_len, ' ')
+                
+                # Handle variable length (min-max range)
+                elif 'max_length' in constraints or 'min_length' in constraints:
+                    min_len = constraints.get('min_length', 0)
+                    max_len = constraints.get('max_length', None)
+                    
+                    df[col] = df[col].astype(str)
+                    
+                    # Truncate if too long
+                    if max_len is not None:
+                        df[col] = df[col].str[:max_len]
+                    
+                    # Pad if too short (to minimum length)
+                    if min_len > 0:
+                        df[col] = df[col].str.ljust(min_len, ' ')
+            
+            # Apply integer bounds
+            if pd.api.types.is_numeric_dtype(df[col]):
+                # Apply min_value constraint (especially for non-negative IDs)
+                if 'min_value' in constraints:
+                    min_val = constraints['min_value']
+                    df[col] = df[col].clip(lower=min_val)
+                
+                # Apply max_value constraint
+                if 'max_value' in constraints:
+                    max_val = constraints['max_value']
+                    df[col] = df[col].clip(upper=max_val)
+                
+                # Apply integer digit count constraint
+                if 'max_digits' in constraints and pd.api.types.is_integer_dtype(df[col]):
+                    max_digits = constraints['max_digits']
+                    # Ensure values don't exceed max_digits
+                    # Clip to range that fits in max_digits
+                    max_val_for_digits = 10 ** max_digits - 1
+                    df[col] = df[col].clip(upper=max_val_for_digits)
+                    # Round to integers
+                    df[col] = df[col].astype(int)
+                
+                # Apply decimal places constraint for floats
+                if 'decimal_places' in constraints and not pd.api.types.is_integer_dtype(df[col]):
+                    decimal_places = constraints['decimal_places']
+                    # Round to specified decimal places
+                    df[col] = df[col].round(decimal_places)
+            
+            # Ensure dates are valid (not negative timestamps)
+            # This runs BEFORE datetime conversion, so values are still numeric (nanoseconds)
+            if col in self._datetime_columns and pd.api.types.is_numeric_dtype(df[col]):
+                min_timestamp = pd.Timestamp('1900-01-01').value  # nanoseconds since epoch
+                df[col] = df[col].clip(lower=min_timestamp)
+        
+        return df
+    
+    def _detect_datetime_format(self, date_str: str) -> Optional[str]:
+        """Detect datetime format from a sample string.
+        
+        Returns format string compatible with strftime/strptime, or None if not detected.
+        """
+        import re
+        from datetime import datetime
+        
+        # Common datetime format patterns
+        format_patterns = [
+            # Format: 2019-10-01 00:00:00.000
+            (r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$', '%Y-%m-%d %H:%M:%S.%f'),
+            # Format: 2019-10-01 00:00:00
+            (r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$', '%Y-%m-%d %H:%M:%S'),
+            # Format: 2019-10-01T00:00:00.000
+            (r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}$', '%Y-%m-%dT%H:%M:%S.%f'),
+            # Format: 2019-10-01T00:00:00
+            (r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$', '%Y-%m-%dT%H:%M:%S'),
+            # Format: 2019-10-01
+            (r'^\d{4}-\d{2}-\d{2}$', '%Y-%m-%d'),
+            # Format: 01/10/2019
+            (r'^\d{2}/\d{2}/\d{4}', '%d/%m/%Y'),
+            # Format: 10/01/2019 (US format)
+            (r'^\d{2}/\d{2}/\d{4}', '%m/%d/%Y'),
+        ]
+        
+        # Try to match pattern
+        for pattern, fmt in format_patterns:
+            if re.match(pattern, date_str):
+                # Verify format works by trying to parse
+                try:
+                    datetime.strptime(date_str, fmt)
+                    return fmt
+                except ValueError:
+                    continue
+        
+        # Try pandas auto-parsing and infer format
+        try:
+            dt = pd.to_datetime(date_str, errors='coerce')
+            if pd.notna(dt):
+                # Try common formats
+                common_formats = [
+                    '%Y-%m-%d %H:%M:%S.%f',  # 2019-10-01 00:00:00.000
+                    '%Y-%m-%d %H:%M:%S',     # 2019-10-01 00:00:00
+                    '%Y-%m-%dT%H:%M:%S.%f',  # 2019-10-01T00:00:00.000
+                    '%Y-%m-%dT%H:%M:%S',     # 2019-10-01T00:00:00
+                    '%Y-%m-%d',              # 2019-10-01
+                ]
+                for fmt in common_formats:
+                    try:
+                        parsed = datetime.strptime(date_str, fmt)
+                        if parsed == dt.to_pydatetime():
+                            return fmt
+                    except ValueError:
+                        continue
+        except Exception:
+            pass
+        
+        return None
 
 
