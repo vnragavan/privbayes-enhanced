@@ -70,8 +70,6 @@ class EnhancedPrivBayesAdapter:
         self._date_only_columns = set()  # Track columns that are date-only (not datetime)
         self._integer_columns = set()  # Track columns that are integers (not floats)
         self._column_constraints = {}  # Track schema constraints: max_length, min_value, max_value
-        self._column_groups = None  # Track column groups for divide-and-conquer (if columns > 7)
-        self._group_models = []  # Store separate models for each column group
         
     def fit(self, X: pd.DataFrame, y=None, column_constraints: Optional[dict] = None):
         """Fit the model to data.
@@ -92,8 +90,6 @@ class EnhancedPrivBayesAdapter:
         self._date_only_columns = set()  # Reset date-only tracking
         self._integer_columns = set()  # Reset integer tracking
         self._column_constraints = column_constraints or {}  # Store schema constraints
-        self._column_groups = None  # Reset column groups
-        self._group_models = []  # Reset group models
         
         # Auto-detect constraints from data if not provided
         if not self._column_constraints:
@@ -175,39 +171,7 @@ class EnhancedPrivBayesAdapter:
                     X2[c] = s
         
         self._real_data = X2
-        
-        # Divide-and-conquer approach: if columns > 7, split into groups of 7
-        num_columns = len(X.columns)
-        if num_columns > 7:
-            # Split columns into groups of 7
-            column_list = list(X.columns)
-            self._column_groups = [column_list[i:i+7] for i in range(0, len(column_list), 7)]
-            
-            # Create and fit separate models for each group
-            self._group_models = []
-            for group_idx, group_cols in enumerate(self._column_groups):
-                # Create a new adapter instance for this group
-                group_adapter = EnhancedPrivBayesAdapter(
-                    epsilon=self.epsilon,
-                    delta=self.delta,
-                    seed=self.seed + group_idx,  # Different seed for each group
-                    temperature=self.temperature,
-                    cpt_smoothing=self.cpt_smoothing,
-                    label_columns=[c for c in (self.kwargs.get('label_columns') or []) if c in group_cols],
-                    public_categories={c: v for c, v in (self.kwargs.get('public_categories') or {}).items() if c in group_cols},
-                    cat_keep_all_nonzero=self.kwargs.get('cat_keep_all_nonzero', True),
-                    **{k: v for k, v in self.kwargs.items() if k not in ['label_columns', 'public_categories', 'cat_keep_all_nonzero']}
-                )
-                
-                # Extract group-specific constraints
-                group_constraints = {c: self._column_constraints.get(c, {}) for c in group_cols if c in self._column_constraints}
-                
-                # Fit model on this column group
-                group_adapter.fit(X[group_cols], column_constraints=group_constraints)
-                self._group_models.append(group_adapter)
-        else:
-            # Standard approach: fit single model on all columns
-            self.model.fit(X2)
+        self.model.fit(X2)
         
         self._fitted = True
         return self
@@ -220,71 +184,36 @@ class EnhancedPrivBayesAdapter:
         if n_samples is None:
             n_samples = len(self._real_data)
         
-        # Divide-and-conquer approach: if columns were split, merge results from groups
-        if self._column_groups is not None and len(self._group_models) > 0:
-            # Generate synthetic data for each column group
-            group_dfs = []
-            for group_adapter in self._group_models:
-                group_df = group_adapter.sample(n_samples)
-                group_dfs.append(group_df)
-            
-            # Merge all groups horizontally (by index)
-            synthetic_df = pd.concat(group_dfs, axis=1)
-            
-            # Aggregate datetime/integer tracking from all groups
-            for group_adapter in self._group_models:
-                self._datetime_columns.update(group_adapter._datetime_columns)
-                self._datetime_formats.update(group_adapter._datetime_formats)
-                self._date_only_columns.update(group_adapter._date_only_columns)
-                self._integer_columns.update(group_adapter._integer_columns)
-            
-            # Ensure column order matches original
-            if self._original_columns is not None:
-                # Reorder to match original column order
-                missing_cols = [col for col in self._original_columns if col not in synthetic_df.columns]
-                if missing_cols:
-                    for col in missing_cols:
-                        synthetic_df[col] = np.nan
-                extra_cols = [col for col in synthetic_df.columns if col not in self._original_columns]
-                if extra_cols:
-                    synthetic_df = synthetic_df.drop(columns=extra_cols)
-                synthetic_df = synthetic_df[self._original_columns]
-        else:
-            # Standard approach: generate from single model
-            synthetic_df = self.model.sample(n_samples, seed=self.seed)
+        # Generate synthetic data
+        synthetic_df = self.model.sample(n_samples, seed=self.seed)
         
         # Apply schema constraints BEFORE datetime conversion (so we can clip negative timestamps)
-        # Note: For divide-and-conquer, constraints are already applied by each group adapter
-        if self._column_groups is None:
-            synthetic_df = self._apply_constraints(synthetic_df)
+        synthetic_df = self._apply_constraints(synthetic_df)
         
         # Convert datetime columns back to readable format (after constraints applied)
-        # Note: For divide-and-conquer, datetime conversion is already done by each group adapter
-        # But we still need to ensure consistency, so we'll skip this for divide-and-conquer
-        if self._column_groups is None:
-            for col, dtype in self._datetime_columns.items():
-                if col in synthetic_df.columns:
-                    if dtype == 'datetime64[ns]':
-                        # Convert nanoseconds (int64) back to datetime
-                        dt_series = pd.to_datetime(synthetic_df[col], errors='coerce')
-                        
-                        # Apply original format if detected
-                        if col in self._datetime_formats:
-                            fmt = self._datetime_formats[col]
-                            if fmt:
-                                # Format as string with original format
-                                # This preserves the format when saved to CSV
-                                synthetic_df[col] = dt_series.dt.strftime(fmt)
-                            else:
-                                synthetic_df[col] = dt_series
-                        elif col in self._date_only_columns:
-                            # Date-only column: format as date (YYYY-MM-DD)
-                            synthetic_df[col] = dt_series.dt.strftime('%Y-%m-%d')
+        for col, dtype in self._datetime_columns.items():
+            if col in synthetic_df.columns:
+                if dtype == 'datetime64[ns]':
+                    # Convert nanoseconds (int64) back to datetime
+                    dt_series = pd.to_datetime(synthetic_df[col], errors='coerce')
+                    
+                    # Apply original format if detected
+                    if col in self._datetime_formats:
+                        fmt = self._datetime_formats[col]
+                        if fmt:
+                            # Format as string with original format
+                            # This preserves the format when saved to CSV
+                            synthetic_df[col] = dt_series.dt.strftime(fmt)
                         else:
                             synthetic_df[col] = dt_series
-                    elif dtype == 'timedelta64[ns]':
-                        # Convert nanoseconds (int64) back to timedelta
-                        synthetic_df[col] = pd.to_timedelta(synthetic_df[col], errors='coerce')
+                    elif col in self._date_only_columns:
+                        # Date-only column: format as date (YYYY-MM-DD)
+                        synthetic_df[col] = dt_series.dt.strftime('%Y-%m-%d')
+                    else:
+                        synthetic_df[col] = dt_series
+                elif dtype == 'timedelta64[ns]':
+                    # Convert nanoseconds (int64) back to timedelta
+                    synthetic_df[col] = pd.to_timedelta(synthetic_df[col], errors='coerce')
         
         # Ensure column order and names match original data exactly
         if self._original_columns is not None:
