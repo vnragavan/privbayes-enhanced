@@ -913,7 +913,14 @@ class PrivBayesSynthesizerEnhanced:
                     self._cpt[c] = {"parents": [], "parent_card": [], "probs": probs}
                     continue
                 counts = np.zeros((S, k_child), dtype=float)
-                pa_codes = np.stack([disc[p].to_numpy(dtype=np.int64, copy=False) for p in pa], axis=0)
+                # Get parent codes and clip them to valid ranges
+                pa_codes_list = []
+                for i, p in enumerate(pa):
+                    p_codes = disc[p].to_numpy(dtype=np.int64, copy=False)
+                    # Clip to valid range for this parent (0 to par_ks[i]-1)
+                    p_codes_clipped = np.clip(p_codes, 0, par_ks[i] - 1)
+                    pa_codes_list.append(p_codes_clipped)
+                pa_codes = np.stack(pa_codes_list, axis=0)
                 keys = np.ravel_multi_index(pa_codes, dims=tuple(par_ks), mode="raise")
                 child = disc[c].to_numpy()
                 # Clip child codes to valid range (0 to k_child-1) to handle NULL codes
