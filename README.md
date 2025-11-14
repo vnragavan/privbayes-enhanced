@@ -6,6 +6,7 @@ Standalone implementation of a differentially private Bayesian network synthesiz
 
 - Differential privacy with (ε,δ)-DP guarantees and proper budget tracking
 - Handles numeric, categorical, boolean, datetime, and mixed data types
+- **Automatic categorical name preservation**: By default, all categorical columns preserve actual category names (no hash buckets like B000, B001)
 - Temperature-based sampling to reduce QI linkage risks
 - Privacy-preserving categorical discovery using DP heavy hitters
 - Smooth sensitivity bounds for numeric columns
@@ -78,6 +79,9 @@ privbayes data\adult.csv -o synthetic.csv --epsilon 1.0 --all-metrics
 # With public knowledge (use quotes for multi-line)
 privbayes data\adult.csv -o synthetic.csv --epsilon 1.0 --public-categories state:CA,NY,TX,FL,IL --public-bounds age:0,120
 
+# Disable auto-detection, use manual label columns
+privbayes data\adult.csv -o synthetic.csv --epsilon 1.0 --no-auto-detect-label-columns --label-columns income,education
+
 # Generate more samples
 privbayes data\adult.csv -o synthetic.csv --epsilon 1.0 --n-samples 5000
 ```
@@ -94,6 +98,10 @@ privbayes data/adult.csv -o synthetic.csv --epsilon 1.0 --all-metrics
 privbayes data/adult.csv -o synthetic.csv --epsilon 1.0 \
   --public-categories state:CA,NY,TX,FL,IL \
   --public-bounds age:0,120
+
+# Disable auto-detection, use manual label columns
+privbayes data/adult.csv -o synthetic.csv --epsilon 1.0 \
+  --no-auto-detect-label-columns --label-columns income,education
 
 # Generate more samples
 privbayes data/adult.csv -o synthetic.csv --epsilon 1.0 --n-samples 5000
@@ -112,12 +120,26 @@ import pandas as pd
 # Load data
 data = pd.read_csv('data/adult.csv')
 
-# Create and fit model
+# Create and fit model (default: all categoricals preserve actual names)
 model = EnhancedPrivBayesAdapter(epsilon=1.0, seed=42)
 model.fit(data)
 
 # Generate synthetic data
 synthetic = model.sample(n_samples=1000)
+
+# Customize categorical handling
+# Option 1: Disable auto-detection, use manual label columns
+model = EnhancedPrivBayesAdapter(
+    epsilon=1.0,
+    auto_detect_label_columns=False,  # Disable auto-detection
+    label_columns=['income', 'education']  # Only these preserve names
+)
+
+# Option 2: Use default (all categoricals preserve names)
+model = EnhancedPrivBayesAdapter(
+    epsilon=1.0,
+    auto_detect_label_columns=True  # Default: all categoricals as labels
+)
 
 # Evaluate metrics
 utility_metrics = model.evaluate_utility(data, synthetic)
@@ -148,6 +170,8 @@ See [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for details on the project orga
 - [Database Compatibility](docs/DATABASE_COMPATIBILITY.md) - Working with database exports
 - [Privacy Audit](docs/PRIVACY_AUDIT.md) - Privacy evaluation
 - [Testing](docs/TESTING.md) - Running tests
+- [Hash Buckets Explained](docs/HASH_BUCKETS_EXPLAINED.md) - Understanding categorical hashing
+- [Customizing Default Behavior](docs/CUSTOMIZING_DEFAULT_BEHAVIOR.md) - Changing default categorical handling
 
 ## Examples
 

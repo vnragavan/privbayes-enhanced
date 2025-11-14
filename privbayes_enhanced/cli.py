@@ -109,6 +109,19 @@ Examples:
         dest='label_columns',
         help='Label columns (comma-separated, no hashing, no UNK)'
     )
+    parser.add_argument(
+        '--auto-detect-label-columns',
+        dest='auto_detect_label_columns',
+        action='store_true',
+        default=True,
+        help='Automatically treat all categorical columns as label columns (preserves actual names, no hash buckets). Default: True'
+    )
+    parser.add_argument(
+        '--no-auto-detect-label-columns',
+        dest='auto_detect_label_columns',
+        action='store_false',
+        help='Disable automatic label column detection. Only use manually specified --label-columns'
+    )
     
     # Configuration file
     parser.add_argument(
@@ -359,6 +372,12 @@ def main():
             model_kwargs['label_columns'] = [c.strip() for c in args.label_columns.split(',')]
         elif 'label_columns' in config:
             model_kwargs['label_columns'] = config['label_columns']
+        
+        # Handle auto_detect_label_columns
+        if 'auto_detect_label_columns' not in model_kwargs:
+            model_kwargs['auto_detect_label_columns'] = args.auto_detect_label_columns
+        elif 'auto_detect_label_columns' in config:
+            model_kwargs['auto_detect_label_columns'] = config['auto_detect_label_columns']
         
         # Parse epsilon split
         if args.eps_split:

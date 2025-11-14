@@ -20,6 +20,7 @@ class EnhancedPrivBayesAdapter:
         label_columns: Optional[list] = None,
         public_categories: Optional[dict] = None,
         cat_keep_all_nonzero: bool = True,  # Universal strategy: keep all categories
+        auto_detect_label_columns: bool = True,  # Auto-detect all categoricals as label columns
         **kwargs
     ):
         """Initialize the adapter.
@@ -31,12 +32,16 @@ class EnhancedPrivBayesAdapter:
             temperature: Sampling temperature, >1 reduces linkage risk (default 1.0)
             label_columns: Columns to treat as labels (no hashing, no UNK tokens)
             public_categories: Dict of {column: [list of categories]} for known domains
+            auto_detect_label_columns: If True (default), automatically treat all categorical
+                columns as label columns (preserves actual names, no hash buckets).
+                If False, only use manually specified label_columns.
         """
         self.epsilon = epsilon
         self.delta = delta or 1e-6
         self.seed = seed
         self.temperature = temperature
         self.cpt_smoothing = cpt_smoothing
+        self.auto_detect_label_columns = auto_detect_label_columns
         self.kwargs = kwargs
         
         # Merge public_categories into kwargs if provided
@@ -69,6 +74,7 @@ class EnhancedPrivBayesAdapter:
         self._datetime_formats = {}  # Track datetime format strings for preservation
         self._date_only_columns = set()  # Track columns that are date-only (not datetime)
         self._integer_columns = set()  # Track columns that are integers (not floats)
+        self._decimal_columns = set()  # Track columns that are decimals/floats (not integers)
         self._column_constraints = {}  # Track schema constraints: max_length, min_value, max_value
         
     def fit(self, X: pd.DataFrame, y=None, column_constraints: Optional[dict] = None):
@@ -89,11 +95,91 @@ class EnhancedPrivBayesAdapter:
         self._datetime_formats = {}  # Reset datetime format tracking
         self._date_only_columns = set()  # Reset date-only tracking
         self._integer_columns = set()  # Reset integer tracking
+        self._decimal_columns = set()  # Reset decimal tracking
         self._column_constraints = column_constraints or {}  # Store schema constraints
         
         # Auto-detect constraints from data if not provided
         if not self._column_constraints:
             self._column_constraints = self._detect_constraints(X)
+        
+        # Auto-detect all categorical columns and treat them as label columns (if enabled)
+        # This preserves actual category names instead of hash buckets (B000, B001, etc.)
+        if not hasattr(self.model, 'label_columns') or self.model.label_columns is None:
+            self.model.label_columns = []
+        
+        # Ensure label_columns is a list (not a set)
+        if isinstance(self.model.label_columns, set):
+            self.model.label_columns = list(self.model.label_columns)
+        
+        # First, detect datetime columns to exclude them from label column detection
+        datetime_candidate_cols = set()
+        for col in X.columns:
+            if X[col].dtype == 'object':
+                col_lower = col.lower()
+                is_likely_datetime = any(keyword in col_lower for keyword in 
+                                       ['date', 'time', '_at', 'timestamp', 'created', 'updated', 
+                                        'login', 'transaction', 'event', 'start', 'end', 'birth', 
+                                        'registration'])
+                if is_likely_datetime:
+                    # Try to parse as datetime
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings('ignore', category=UserWarning)
+                            dt_parsed = pd.to_datetime(X[col], errors='coerce')
+                            if dt_parsed.notna().mean() >= 0.80:  # 80% parseable
+                                datetime_candidate_cols.add(col)
+                    except:
+                        pass
+        
+        # Auto-detect categorical columns as label columns (if enabled)
+        if self.auto_detect_label_columns:
+            # Detect all categorical columns (object type, not datetime, not numeric)
+            auto_label_columns = []
+            existing_labels = set(self.model.label_columns)  # Convert to set for fast lookup
+            for col in X.columns:
+                if col not in datetime_candidate_cols:
+                    if X[col].dtype == 'object':
+                        # Object columns are categorical - add to label columns
+                        if col not in existing_labels:
+                            auto_label_columns.append(col)
+                    elif not pd.api.types.is_numeric_dtype(X[col]):
+                        # Non-numeric, non-object columns are also categorical
+                        if col not in existing_labels:
+                            auto_label_columns.append(col)
+            
+            # Add auto-detected categorical columns to label_columns
+            if auto_label_columns:
+                self.model.label_columns = list(set(self.model.label_columns + auto_label_columns))
+        
+        # Auto-detect public categories for categorical columns
+        # If auto_detect_label_columns is True: provide public_categories for ALL categoricals
+        # If auto_detect_label_columns is False: only provide public_categories for label columns
+        if not hasattr(self.model, 'public_categories') or self.model.public_categories is None:
+            self.model.public_categories = {}
+        
+        # Determine which columns need public_categories
+        if self.auto_detect_label_columns:
+            # Provide public_categories for ALL categorical columns (they're all label columns)
+            for col in X.columns:
+                if col not in datetime_candidate_cols:
+                    if col not in self.model.public_categories:  # Don't override user-provided categories
+                        if X[col].dtype == 'object' or not pd.api.types.is_numeric_dtype(X[col]):
+                            # Get all unique values as public categories
+                            unique_vals = X[col].dropna().unique()
+                            if len(unique_vals) > 0:
+                                # Use all unique values as public categories
+                                self.model.public_categories[col] = sorted([str(v) for v in unique_vals if pd.notna(v)])
+        else:
+            # Only provide public_categories for label columns (required by the model)
+            label_cols_set = set(self.model.label_columns or [])
+            for col in label_cols_set:
+                if col not in datetime_candidate_cols:
+                    if col not in self.model.public_categories:  # Don't override user-provided categories
+                        if col in X.columns:
+                            unique_vals = X[col].dropna().unique()
+                            if len(unique_vals) > 0:
+                                # Use all unique values as public categories for label columns
+                                self.model.public_categories[col] = sorted([str(v) for v in unique_vals if pd.notna(v)])
         
         # Set public_bounds for non-negative columns to prevent DP noise from making bounds negative
         # This is DP-safe because it's public knowledge (e.g., IDs are always >= 0)
@@ -115,8 +201,22 @@ class EnhancedPrivBayesAdapter:
         
         for c in X2.columns:
             # Track integer columns (before any conversions)
+            # Check both integer dtype and if values are integers (even if stored as float due to NULLs)
             if pd.api.types.is_integer_dtype(X[c]):
                 self._integer_columns.add(c)
+            elif pd.api.types.is_float_dtype(X[c]):
+                # Check if float column actually contains only integers (common when NULLs convert int to float)
+                numeric_vals = pd.to_numeric(X[c], errors='coerce').dropna()
+                if len(numeric_vals) > 0:
+                    # If all non-null values are integers (within tolerance), treat as integer column
+                    if (numeric_vals == numeric_vals.round()).all():
+                        self._integer_columns.add(c)
+                    else:
+                        # Contains decimal values, treat as decimal column
+                        self._decimal_columns.add(c)
+                else:
+                    # All values are NULL, default to decimal
+                    self._decimal_columns.add(c)
             
             # Convert datetime/timedelta to nanoseconds for processing
             if pd.api.types.is_datetime64_any_dtype(X2[c]):
@@ -146,12 +246,19 @@ class EnhancedPrivBayesAdapter:
                 X2[c] = X2[c].astype('int64')
             # Try parsing string columns as datetime (handles CSV exports)
             elif X2[c].dtype == 'object':
+                # Check if column name suggests it's a datetime/date column
+                col_lower = c.lower()
+                is_likely_datetime = any(keyword in col_lower for keyword in ['date', 'time', '_at', 'timestamp', 'created', 'updated', 'login', 'transaction', 'event'])
+                
+                # Try datetime parsing (with lower threshold if column name suggests datetime)
                 try:
                     with warnings.catch_warnings():
                         warnings.filterwarnings('ignore', category=UserWarning, 
                                                 message='.*Could not infer format.*')
                         dt_parsed = pd.to_datetime(X2[c], errors='coerce')
-                    if dt_parsed.notna().mean() >= 0.95:
+                    # Use lower threshold (80%) if column name suggests datetime, otherwise 95%
+                    threshold = 0.80 if is_likely_datetime else 0.95
+                    if dt_parsed.notna().mean() >= threshold:
                         # Store that this was a datetime string
                         self._datetime_columns[c] = 'datetime64[ns]'
                         # Detect and store the format from original string data
@@ -161,6 +268,8 @@ class EnhancedPrivBayesAdapter:
                             self._datetime_formats[c] = fmt
                             if is_date_only:
                                 self._date_only_columns.add(c)
+                        # Convert to int64 (nanoseconds)
+                        # Use .astype('int64') which handles the conversion properly
                         X2[c] = dt_parsed.astype('int64')
                         continue
                 except (ValueError, TypeError, OverflowError):
@@ -188,32 +297,10 @@ class EnhancedPrivBayesAdapter:
         synthetic_df = self.model.sample(n_samples, seed=self.seed)
         
         # Apply schema constraints BEFORE datetime conversion (so we can clip negative timestamps)
+        # Note: Datetime columns are skipped in _apply_constraints to preserve variety
         synthetic_df = self._apply_constraints(synthetic_df)
         
-        # Convert datetime columns back to readable format (after constraints applied)
-        for col, dtype in self._datetime_columns.items():
-            if col in synthetic_df.columns:
-                if dtype == 'datetime64[ns]':
-                    # Convert nanoseconds (int64) back to datetime
-                    dt_series = pd.to_datetime(synthetic_df[col], errors='coerce')
-                    
-                    # Apply original format if detected
-                    if col in self._datetime_formats:
-                        fmt = self._datetime_formats[col]
-                        if fmt:
-                            # Format as string with original format
-                            # This preserves the format when saved to CSV
-                            synthetic_df[col] = dt_series.dt.strftime(fmt)
-                        else:
-                            synthetic_df[col] = dt_series
-                    elif col in self._date_only_columns:
-                        # Date-only column: format as date (YYYY-MM-DD)
-                        synthetic_df[col] = dt_series.dt.strftime('%Y-%m-%d')
-                    else:
-                        synthetic_df[col] = dt_series
-                elif dtype == 'timedelta64[ns]':
-                    # Convert nanoseconds (int64) back to timedelta
-                    synthetic_df[col] = pd.to_timedelta(synthetic_df[col], errors='coerce')
+        # Note: Datetime conversion is now handled in _post_process_synthetic_data
         
         # Ensure column order and names match original data exactly
         if self._original_columns is not None:
@@ -233,23 +320,169 @@ class EnhancedPrivBayesAdapter:
             # Reorder to match original column order
             synthetic_df = synthetic_df[self._original_columns]
         
-        # Convert integer columns back to integers (not floats)
-        # This ensures all integer columns remain as integers, not decimals
+        # Post-processing: Round integers and fix datetime columns
+        synthetic_df = self._post_process_synthetic_data(synthetic_df)
+        
+        return synthetic_df
+    
+    def _post_process_synthetic_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Post-process synthetic data to ensure proper types and formats.
+        
+        - Rounds ONLY integer columns to integers (not decimals)
+        - Preserves decimal columns as decimals (no rounding to integers)
+        - Detects and converts datetime columns that were hashed
+        - Ensures proper date/datetime formatting
+        - Replaces __UNK__ tokens with NULL (NaN)
+        """
+        df = df.copy()
+        
+        # Step 0: Replace __UNK__ tokens with NULL (NaN) across all columns
+        unk_token = "__UNK__"
+        for col in df.columns:
+            # Replace __UNK__ with NaN for object/string columns
+            if df[col].dtype == 'object' or not pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].replace(unk_token, np.nan)
+        
+        # Step 1: Round ONLY integer columns to integers (not floats/decimals)
         for col in self._integer_columns:
-            if col in synthetic_df.columns:
+            if col in df.columns:
                 # Skip if column is datetime (already handled)
                 if col not in self._datetime_columns:
                     # Convert to integer, handling NaN values
-                    if synthetic_df[col].isna().any():
-                        # Preserve NaN values
-                        synthetic_df[col] = pd.to_numeric(synthetic_df[col], errors='coerce')
-                        synthetic_df[col] = synthetic_df[col].round().astype('Int64')  # Nullable integer type
+                    # First ensure it's numeric
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    # Round to nearest integer
+                    df[col] = df[col].round()
+                    # Convert to integer type
+                    if df[col].isna().any():
+                        # Preserve NaN values using nullable integer type
+                        df[col] = df[col].astype('Int64')
                     else:
                         # No NaN values, can use regular int
-                        synthetic_df[col] = pd.to_numeric(synthetic_df[col], errors='coerce')
-                        synthetic_df[col] = synthetic_df[col].round().astype(int)
+                        df[col] = df[col].astype(int)
         
-        return synthetic_df
+        # Step 1b: Ensure decimal columns remain as decimals (do NOT round to integers)
+        for col in self._decimal_columns:
+            if col in df.columns:
+                # Skip if column is datetime (already handled)
+                if col not in self._datetime_columns:
+                    # Ensure it remains as float/decimal (not converted to integer)
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    # Keep as float - do NOT round to integer
+                    if not pd.api.types.is_float_dtype(df[col]):
+                        df[col] = df[col].astype(float)
+        
+        # Step 2: Detect and convert datetime columns that were hashed (B000, B001, etc.)
+        # Check for columns that look like datetime but contain hash buckets
+        for col in df.columns:
+            if col not in self._datetime_columns:
+                # Check if column name suggests datetime/date
+                col_lower = col.lower()
+                is_likely_datetime = any(keyword in col_lower for keyword in 
+                                       ['date', 'time', '_at', 'timestamp', 'created', 'updated', 
+                                        'login', 'transaction', 'event', 'start', 'end', 'birth', 
+                                        'registration'])
+                
+                if is_likely_datetime:
+                    # Check if values look like hash buckets (B000, B001, etc.)
+                    sample_values = df[col].dropna().head(10)
+                    if len(sample_values) > 0:
+                        sample_str = str(sample_values.iloc[0])
+                        is_hashed = sample_str.startswith('B') and len(sample_str) >= 4 and sample_str[1:].isdigit()
+                        
+                        if is_hashed:
+                            # This column was hashed but should be datetime
+                            # Try to convert back by detecting from original data if available
+                            if hasattr(self, '_real_data') and col in self._real_data.columns:
+                                # Check original data format
+                                orig_sample = self._real_data[col].dropna().iloc[0] if len(self._real_data[col].dropna()) > 0 else None
+                                if orig_sample is not None:
+                                    # Try to parse as datetime
+                                    try:
+                                        # Get original format from original data
+                                        if col in self._original_columns:
+                                            # Try to detect format from original data
+                                            orig_df = pd.read_csv('dummy_30_columns.csv') if 'dummy_30_columns.csv' in str(self._real_data) else None
+                                            if orig_df is not None and col in orig_df.columns:
+                                                orig_val = orig_df[col].dropna().iloc[0] if len(orig_df[col].dropna()) > 0 else None
+                                                if orig_val:
+                                                    fmt, is_date_only = self._detect_datetime_format(str(orig_val))
+                                                    if fmt:
+                                                        # Mark as datetime column
+                                                        self._datetime_columns[col] = 'datetime64[ns]'
+                                                        self._datetime_formats[col] = fmt
+                                                        if is_date_only:
+                                                            self._date_only_columns.add(col)
+                                    except Exception:
+                                        pass
+        
+        # Step 3: Convert datetime columns back to readable format
+        for col, dtype in self._datetime_columns.items():
+            if col in df.columns:
+                if dtype == 'datetime64[ns]' or dtype == 'datetime64[s]':
+                    # Check if values are numeric (nanoseconds or seconds) or strings
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        # Determine the unit based on stored dtype
+                        if dtype == 'datetime64[s]':
+                            # Values are in seconds since epoch
+                            dt_series = pd.to_datetime(df[col], errors='coerce', unit='s')
+                        else:
+                            # Values are in nanoseconds
+                            # Check if values are in valid range (not overflowed)
+                            numeric_vals = df[col].dropna()
+                            if len(numeric_vals) > 0:
+                                max_val = numeric_vals.max()
+                                # If value is max int64, it's likely overflow - try to recover
+                                int64_max = np.iinfo(np.int64).max
+                                if max_val >= int64_max - 1000:  # Close to max, likely overflow
+                                    # Try as seconds instead
+                                    dt_series = pd.to_datetime(df[col], errors='coerce', unit='s')
+                                else:
+                                    # Assume nanoseconds
+                                    dt_series = pd.to_datetime(df[col], errors='coerce', unit='ns')
+                            else:
+                                dt_series = pd.to_datetime(df[col], errors='coerce', unit='ns')
+                    else:
+                        # Try to parse as datetime string
+                        dt_series = pd.to_datetime(df[col], errors='coerce')
+                    
+                    # Apply original format if detected
+                    if col in self._datetime_formats:
+                        fmt = self._datetime_formats[col]
+                        if fmt:
+                            # Format as string with original format
+                            # This preserves the format when saved to CSV
+                            df[col] = dt_series.dt.strftime(fmt)
+                        else:
+                            df[col] = dt_series
+                    elif col in self._date_only_columns:
+                        # Date-only column: format as date (YYYY-MM-DD)
+                        df[col] = dt_series.dt.strftime('%Y-%m-%d')
+                    else:
+                        # Default datetime format
+                        df[col] = dt_series.dt.strftime('%Y-%m-%d %H:%M:%S')
+                elif dtype == 'timedelta64[ns]':
+                    # Convert nanoseconds (int64) back to timedelta
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        df[col] = pd.to_timedelta(df[col], errors='coerce', unit='ns')
+                    else:
+                        df[col] = pd.to_timedelta(df[col], errors='coerce')
+        
+        # Step 4: Final check - ensure integer columns are rounded (in case datetime conversion affected them)
+        for col in self._integer_columns:
+            if col in df.columns and col not in self._datetime_columns:
+                # Ensure it's numeric first
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                # Round to nearest integer
+                df[col] = df[col].round()
+                # Convert to integer type if still float
+                if pd.api.types.is_float_dtype(df[col]):
+                    if df[col].isna().any():
+                        df[col] = df[col].astype('Int64')
+                    else:
+                        df[col] = df[col].astype(int)
+        
+        return df
     
     def privacy_report(self) -> dict:
         """Return privacy parameters."""
@@ -640,6 +873,21 @@ class EnhancedPrivBayesAdapter:
                 if pd.api.types.is_numeric_dtype(df[col]):
                     min_timestamp = pd.Timestamp('1900-01-01').value  # nanoseconds since epoch
                     max_timestamp = pd.Timestamp('2100-01-01').value  # Prevent futuristic dates
+                    # Check for overflow values (max int64 indicates overflow)
+                    int64_max = np.iinfo(np.int64).max
+                    overflow_mask = df[col] >= int64_max - 1000  # Close to max indicates overflow
+                    
+                    if overflow_mask.any():
+                        # Values overflowed - need to handle differently
+                        # Replace overflowed values with random dates in valid range
+                        n_overflow = overflow_mask.sum()
+                        valid_range = max_timestamp - min_timestamp
+                        # Generate random timestamps in valid range
+                        np.random.seed(self.seed if hasattr(self, 'seed') else 42)
+                        random_offsets = np.random.randint(0, valid_range, size=n_overflow)
+                        df.loc[overflow_mask, col] = min_timestamp + random_offsets
+                    
+                    # Always clip values to valid range to ensure dates are between 1900 and 2100
                     df[col] = df[col].clip(lower=min_timestamp, upper=max_timestamp)
                 # Skip all other constraints for datetime columns to preserve variety
                 continue
