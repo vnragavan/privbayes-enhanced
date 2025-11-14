@@ -860,7 +860,10 @@ class PrivBayesSynthesizerEnhanced:
                     k_child = k_child + 1  # Add one bin for NULL
             
             if len(pa) == 0:
-                counts = np.bincount(disc[c].to_numpy(), minlength=k_child).astype(float)
+                child_codes = disc[c].to_numpy()
+                # Clip child codes to valid range (0 to k_child-1) to handle NULL codes
+                child_codes_clipped = np.clip(child_codes, 0, k_child - 1)
+                counts = np.bincount(child_codes_clipped, minlength=k_child).astype(float)
                 if eps_per_var > 0:
                     counts += self._lap(eps_per_var, counts.shape, sens=1.0)
                 # Apply smoothing to DP-noisy counts
@@ -897,7 +900,10 @@ class PrivBayesSynthesizerEnhanced:
                 if S * k_child > max_cells:
                     raise MemoryError(f"CPT for {c} too large after pruning.")
                 if len(pa) == 0:
-                    counts = np.bincount(disc[c].to_numpy(), minlength=k_child).astype(float)
+                    child_codes = disc[c].to_numpy()
+                    # Clip child codes to valid range (0 to k_child-1) to handle NULL codes
+                    child_codes_clipped = np.clip(child_codes, 0, k_child - 1)
+                    counts = np.bincount(child_codes_clipped, minlength=k_child).astype(float)
                     if eps_per_var > 0:
                         counts += self._lap(eps_per_var, counts.shape, sens=1.0)
                     # Apply smoothing to DP-noisy counts
@@ -910,7 +916,9 @@ class PrivBayesSynthesizerEnhanced:
                 pa_codes = np.stack([disc[p].to_numpy(dtype=np.int64, copy=False) for p in pa], axis=0)
                 keys = np.ravel_multi_index(pa_codes, dims=tuple(par_ks), mode="raise")
                 child = disc[c].to_numpy()
-                np.add.at(counts, (keys, child), 1.0)
+                # Clip child codes to valid range (0 to k_child-1) to handle NULL codes
+                child_clipped = np.clip(child, 0, k_child - 1)
+                np.add.at(counts, (keys, child_clipped), 1.0)
                 if eps_per_var > 0:
                     counts += self._lap(eps_per_var, counts.shape, sens=1.0)
                 row_sums = counts.sum(axis=1, keepdims=True)
