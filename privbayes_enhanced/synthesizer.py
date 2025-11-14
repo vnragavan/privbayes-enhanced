@@ -809,8 +809,20 @@ class PrivBayesSynthesizerEnhanced:
                     y = disc[p].to_numpy()
                     kx = self._meta[c].k
                     ky = self._meta[p].k
+                    
+                    # Extend kx/ky if NULL codes are present (for numeric columns)
+                    if self._meta[c].kind == "numeric":
+                        if (x >= kx).any():
+                            kx = kx + 1  # Add one for NULL bin
+                    if self._meta[p].kind == "numeric":
+                        if (y >= ky).any():
+                            ky = ky + 1  # Add one for NULL bin
+                    
                     joint = np.zeros((kx, ky), dtype=float)
-                    np.add.at(joint, (x, y), 1.0)
+                    # Clip codes to valid range before indexing
+                    x_clipped = np.clip(x, 0, kx - 1)
+                    y_clipped = np.clip(y, 0, ky - 1)
+                    np.add.at(joint, (x_clipped, y_clipped), 1.0)
                     joint += self._lap(eps_per_pair, joint.shape, sens=1.0)
                     joint = np.maximum(joint, 0.0) + SMOOTH
                     pxy = joint / joint.sum()
