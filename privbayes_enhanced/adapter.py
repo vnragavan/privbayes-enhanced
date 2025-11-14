@@ -1,6 +1,6 @@
 """High-level adapter for Enhanced PrivBayes."""
 
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import warnings
 import pandas as pd
 import numpy as np
@@ -67,7 +67,11 @@ class EnhancedPrivBayesAdapter:
         self._original_columns = None  # Track original column order and names
         self._datetime_columns = {}  # Track columns that were originally datetime
         self._datetime_formats = {}  # Track datetime format strings for preservation
+        self._date_only_columns = set()  # Track columns that are date-only (not datetime)
+        self._integer_columns = set()  # Track columns that are integers (not floats)
         self._column_constraints = {}  # Track schema constraints: max_length, min_value, max_value
+        self._column_groups = None  # Track column groups for divide-and-conquer (if columns > 7)
+        self._group_models = []  # Store separate models for each column group
         
     def fit(self, X: pd.DataFrame, y=None, column_constraints: Optional[dict] = None):
         """Fit the model to data.
@@ -85,7 +89,11 @@ class EnhancedPrivBayesAdapter:
         self._original_columns = list(X.columns)
         self._datetime_columns = {}  # Reset datetime tracking
         self._datetime_formats = {}  # Reset datetime format tracking
+        self._date_only_columns = set()  # Reset date-only tracking
+        self._integer_columns = set()  # Reset integer tracking
         self._column_constraints = column_constraints or {}  # Store schema constraints
+        self._column_groups = None  # Reset column groups
+        self._group_models = []  # Reset group models
         
         # Auto-detect constraints from data if not provided
         if not self._column_constraints:
@@ -110,6 +118,10 @@ class EnhancedPrivBayesAdapter:
                     self.model.public_bounds[col] = [0.0, float(max_val)]
         
         for c in X2.columns:
+            # Track integer columns (before any conversions)
+            if pd.api.types.is_integer_dtype(X[c]):
+                self._integer_columns.add(c)
+            
             # Convert datetime/timedelta to nanoseconds for processing
             if pd.api.types.is_datetime64_any_dtype(X2[c]):
                 # Store original datetime type
@@ -119,7 +131,18 @@ class EnhancedPrivBayesAdapter:
                     # Try to detect format from first non-null value
                     sample_val = X[c].dropna().iloc[0] if len(X[c].dropna()) > 0 else None
                     if sample_val is not None:
-                        self._datetime_formats[c] = self._detect_datetime_format(str(sample_val))
+                        fmt, is_date_only = self._detect_datetime_format(str(sample_val))
+                        self._datetime_formats[c] = fmt
+                        if is_date_only:
+                            self._date_only_columns.add(c)
+                # Also check if it's date-only by examining the parsed datetime
+                elif pd.api.types.is_datetime64_any_dtype(X[c]):
+                    # Check if all times are midnight (date-only)
+                    if X[c].dropna().dt.time.nunique() == 1:
+                        first_time = X[c].dropna().dt.time.iloc[0] if len(X[c].dropna()) > 0 else None
+                        if first_time is not None and first_time == pd.Timestamp('00:00:00').time():
+                            self._date_only_columns.add(c)
+                            self._datetime_formats[c] = '%Y-%m-%d'
                 X2[c] = X2[c].astype('int64')
             elif pd.api.types.is_timedelta64_dtype(X2[c]):
                 # Store original timedelta type
@@ -138,7 +161,10 @@ class EnhancedPrivBayesAdapter:
                         # Detect and store the format from original string data
                         sample_val = X[c].dropna().iloc[0] if len(X[c].dropna()) > 0 else None
                         if sample_val is not None:
-                            self._datetime_formats[c] = self._detect_datetime_format(str(sample_val))
+                            fmt, is_date_only = self._detect_datetime_format(str(sample_val))
+                            self._datetime_formats[c] = fmt
+                            if is_date_only:
+                                self._date_only_columns.add(c)
                         X2[c] = dt_parsed.astype('int64')
                         continue
                 except (ValueError, TypeError, OverflowError):
@@ -149,7 +175,39 @@ class EnhancedPrivBayesAdapter:
                     X2[c] = s
         
         self._real_data = X2
-        self.model.fit(X2)
+        
+        # Divide-and-conquer approach: if columns > 7, split into groups of 7
+        num_columns = len(X.columns)
+        if num_columns > 7:
+            # Split columns into groups of 7
+            column_list = list(X.columns)
+            self._column_groups = [column_list[i:i+7] for i in range(0, len(column_list), 7)]
+            
+            # Create and fit separate models for each group
+            self._group_models = []
+            for group_idx, group_cols in enumerate(self._column_groups):
+                # Create a new adapter instance for this group
+                group_adapter = EnhancedPrivBayesAdapter(
+                    epsilon=self.epsilon,
+                    delta=self.delta,
+                    seed=self.seed + group_idx,  # Different seed for each group
+                    temperature=self.temperature,
+                    cpt_smoothing=self.cpt_smoothing,
+                    label_columns=[c for c in (self.kwargs.get('label_columns') or []) if c in group_cols],
+                    public_categories={c: v for c, v in (self.kwargs.get('public_categories') or {}).items() if c in group_cols},
+                    cat_keep_all_nonzero=self.kwargs.get('cat_keep_all_nonzero', True),
+                    **{k: v for k, v in self.kwargs.items() if k not in ['label_columns', 'public_categories', 'cat_keep_all_nonzero']}
+                )
+                
+                # Extract group-specific constraints
+                group_constraints = {c: self._column_constraints.get(c, {}) for c in group_cols if c in self._column_constraints}
+                
+                # Fit model on this column group
+                group_adapter.fit(X[group_cols], column_constraints=group_constraints)
+                self._group_models.append(group_adapter)
+        else:
+            # Standard approach: fit single model on all columns
+            self.model.fit(X2)
         
         self._fitted = True
         return self
@@ -162,33 +220,71 @@ class EnhancedPrivBayesAdapter:
         if n_samples is None:
             n_samples = len(self._real_data)
         
-        # Generate synthetic data
-        synthetic_df = self.model.sample(n_samples, seed=self.seed)
+        # Divide-and-conquer approach: if columns were split, merge results from groups
+        if self._column_groups is not None and len(self._group_models) > 0:
+            # Generate synthetic data for each column group
+            group_dfs = []
+            for group_adapter in self._group_models:
+                group_df = group_adapter.sample(n_samples)
+                group_dfs.append(group_df)
+            
+            # Merge all groups horizontally (by index)
+            synthetic_df = pd.concat(group_dfs, axis=1)
+            
+            # Aggregate datetime/integer tracking from all groups
+            for group_adapter in self._group_models:
+                self._datetime_columns.update(group_adapter._datetime_columns)
+                self._datetime_formats.update(group_adapter._datetime_formats)
+                self._date_only_columns.update(group_adapter._date_only_columns)
+                self._integer_columns.update(group_adapter._integer_columns)
+            
+            # Ensure column order matches original
+            if self._original_columns is not None:
+                # Reorder to match original column order
+                missing_cols = [col for col in self._original_columns if col not in synthetic_df.columns]
+                if missing_cols:
+                    for col in missing_cols:
+                        synthetic_df[col] = np.nan
+                extra_cols = [col for col in synthetic_df.columns if col not in self._original_columns]
+                if extra_cols:
+                    synthetic_df = synthetic_df.drop(columns=extra_cols)
+                synthetic_df = synthetic_df[self._original_columns]
+        else:
+            # Standard approach: generate from single model
+            synthetic_df = self.model.sample(n_samples, seed=self.seed)
         
         # Apply schema constraints BEFORE datetime conversion (so we can clip negative timestamps)
-        synthetic_df = self._apply_constraints(synthetic_df)
+        # Note: For divide-and-conquer, constraints are already applied by each group adapter
+        if self._column_groups is None:
+            synthetic_df = self._apply_constraints(synthetic_df)
         
         # Convert datetime columns back to readable format (after constraints applied)
-        for col, dtype in self._datetime_columns.items():
-            if col in synthetic_df.columns:
-                if dtype == 'datetime64[ns]':
-                    # Convert nanoseconds (int64) back to datetime
-                    dt_series = pd.to_datetime(synthetic_df[col], errors='coerce')
-                    
-                    # Apply original format if detected
-                    if col in self._datetime_formats:
-                        fmt = self._datetime_formats[col]
-                        if fmt:
-                            # Format as string with original format, then convert back to datetime
-                            # This preserves the format when saved to CSV
-                            synthetic_df[col] = dt_series.dt.strftime(fmt)
+        # Note: For divide-and-conquer, datetime conversion is already done by each group adapter
+        # But we still need to ensure consistency, so we'll skip this for divide-and-conquer
+        if self._column_groups is None:
+            for col, dtype in self._datetime_columns.items():
+                if col in synthetic_df.columns:
+                    if dtype == 'datetime64[ns]':
+                        # Convert nanoseconds (int64) back to datetime
+                        dt_series = pd.to_datetime(synthetic_df[col], errors='coerce')
+                        
+                        # Apply original format if detected
+                        if col in self._datetime_formats:
+                            fmt = self._datetime_formats[col]
+                            if fmt:
+                                # Format as string with original format
+                                # This preserves the format when saved to CSV
+                                synthetic_df[col] = dt_series.dt.strftime(fmt)
+                            else:
+                                synthetic_df[col] = dt_series
+                        elif col in self._date_only_columns:
+                            # Date-only column: format as date (YYYY-MM-DD)
+                            synthetic_df[col] = dt_series.dt.strftime('%Y-%m-%d')
                         else:
                             synthetic_df[col] = dt_series
-                    else:
-                        synthetic_df[col] = dt_series
-                elif dtype == 'timedelta64[ns]':
-                    # Convert nanoseconds (int64) back to timedelta
-                    synthetic_df[col] = pd.to_timedelta(synthetic_df[col], errors='coerce')
+                    elif dtype == 'timedelta64[ns]':
+                        # Convert nanoseconds (int64) back to timedelta
+                        synthetic_df[col] = pd.to_timedelta(synthetic_df[col], errors='coerce')
         
         # Ensure column order and names match original data exactly
         if self._original_columns is not None:
@@ -207,6 +303,22 @@ class EnhancedPrivBayesAdapter:
             
             # Reorder to match original column order
             synthetic_df = synthetic_df[self._original_columns]
+        
+        # Convert integer columns back to integers (not floats)
+        # This ensures all integer columns remain as integers, not decimals
+        for col in self._integer_columns:
+            if col in synthetic_df.columns:
+                # Skip if column is datetime (already handled)
+                if col not in self._datetime_columns:
+                    # Convert to integer, handling NaN values
+                    if synthetic_df[col].isna().any():
+                        # Preserve NaN values
+                        synthetic_df[col] = pd.to_numeric(synthetic_df[col], errors='coerce')
+                        synthetic_df[col] = synthetic_df[col].round().astype('Int64')  # Nullable integer type
+                    else:
+                        # No NaN values, can use regular int
+                        synthetic_df[col] = pd.to_numeric(synthetic_df[col], errors='coerce')
+                        synthetic_df[col] = synthetic_df[col].round().astype(int)
         
         return synthetic_df
     
@@ -590,8 +702,23 @@ class EnhancedPrivBayesAdapter:
                     if min_len > 0:
                         df[col] = df[col].str.ljust(min_len, ' ')
             
+            # Skip constraint application for datetime columns (they're handled separately)
+            # Datetime columns are in nanoseconds and should not have min_value/max_value constraints
+            # applied that would collapse them to a single value
+            if col in self._datetime_columns:
+                # Ensure dates are valid (not too old or too futuristic)
+                # This runs BEFORE datetime conversion, so values are still numeric (nanoseconds)
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    min_timestamp = pd.Timestamp('1900-01-01').value  # nanoseconds since epoch
+                    max_timestamp = pd.Timestamp('2100-01-01').value  # Prevent futuristic dates
+                    df[col] = df[col].clip(lower=min_timestamp, upper=max_timestamp)
+                # Skip all other constraints for datetime columns to preserve variety
+                continue
+            
             # Apply integer bounds
             if pd.api.types.is_numeric_dtype(df[col]):
+                is_integer_col = col in self._integer_columns or pd.api.types.is_integer_dtype(df[col])
+                
                 # Apply min_value constraint (especially for non-negative IDs)
                 if 'min_value' in constraints:
                     min_val = constraints['min_value']
@@ -603,39 +730,46 @@ class EnhancedPrivBayesAdapter:
                     df[col] = df[col].clip(upper=max_val)
                 
                 # Apply integer digit count constraint
-                if 'max_digits' in constraints and pd.api.types.is_integer_dtype(df[col]):
+                if 'max_digits' in constraints and is_integer_col:
                     max_digits = constraints['max_digits']
                     # Ensure values don't exceed max_digits
                     # Clip to range that fits in max_digits
                     max_val_for_digits = 10 ** max_digits - 1
                     df[col] = df[col].clip(upper=max_val_for_digits)
-                    # Round to integers
-                    df[col] = df[col].astype(int)
+                    # Round to integers (preserve NaN if present)
+                    if df[col].isna().any():
+                        df[col] = df[col].round().astype('Int64')  # Nullable integer type
+                    else:
+                        df[col] = df[col].round().astype(int)
                 
-                # Apply decimal places constraint for floats
-                if 'decimal_places' in constraints and not pd.api.types.is_integer_dtype(df[col]):
+                # Apply decimal places constraint for floats only (not integers)
+                if 'decimal_places' in constraints and not is_integer_col:
                     decimal_places = constraints['decimal_places']
                     # Round to specified decimal places
                     df[col] = df[col].round(decimal_places)
-            
-            # Ensure dates are valid (not negative timestamps)
-            # This runs BEFORE datetime conversion, so values are still numeric (nanoseconds)
-            if col in self._datetime_columns and pd.api.types.is_numeric_dtype(df[col]):
-                min_timestamp = pd.Timestamp('1900-01-01').value  # nanoseconds since epoch
-                df[col] = df[col].clip(lower=min_timestamp)
         
         return df
     
-    def _detect_datetime_format(self, date_str: str) -> Optional[str]:
+    def _detect_datetime_format(self, date_str: str) -> Tuple[Optional[str], bool]:
         """Detect datetime format from a sample string.
         
-        Returns format string compatible with strftime/strptime, or None if not detected.
+        Returns:
+            Tuple of (format_string, is_date_only)
+            - format_string: Format compatible with strftime/strptime, or None if not detected
+            - is_date_only: True if date-only (no time component), False if datetime
         """
         import re
         from datetime import datetime
         
-        # Common datetime format patterns
-        format_patterns = [
+        # Date-only patterns (no time component)
+        date_only_patterns = [
+            (r'^\d{4}-\d{2}-\d{2}$', '%Y-%m-%d'),  # 2019-10-01
+            (r'^\d{2}/\d{2}/\d{4}$', '%d/%m/%Y'),  # 01/10/2019
+            (r'^\d{2}/\d{2}/\d{4}$', '%m/%d/%Y'),  # 10/01/2019 (US format)
+        ]
+        
+        # Datetime patterns (with time component)
+        datetime_patterns = [
             # Format: 2019-10-01 00:00:00.000
             (r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$', '%Y-%m-%d %H:%M:%S.%f'),
             # Format: 2019-10-01 00:00:00
@@ -644,21 +778,23 @@ class EnhancedPrivBayesAdapter:
             (r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}$', '%Y-%m-%dT%H:%M:%S.%f'),
             # Format: 2019-10-01T00:00:00
             (r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$', '%Y-%m-%dT%H:%M:%S'),
-            # Format: 2019-10-01
-            (r'^\d{4}-\d{2}-\d{2}$', '%Y-%m-%d'),
-            # Format: 01/10/2019
-            (r'^\d{2}/\d{2}/\d{4}', '%d/%m/%Y'),
-            # Format: 10/01/2019 (US format)
-            (r'^\d{2}/\d{2}/\d{4}', '%m/%d/%Y'),
         ]
         
-        # Try to match pattern
-        for pattern, fmt in format_patterns:
+        # First check if it's date-only (simpler patterns)
+        for pattern, fmt in date_only_patterns:
             if re.match(pattern, date_str):
-                # Verify format works by trying to parse
                 try:
                     datetime.strptime(date_str, fmt)
-                    return fmt
+                    return fmt, True  # Date-only
+                except ValueError:
+                    continue
+        
+        # Then check datetime patterns
+        for pattern, fmt in datetime_patterns:
+            if re.match(pattern, date_str):
+                try:
+                    datetime.strptime(date_str, fmt)
+                    return fmt, False  # Datetime
                 except ValueError:
                     continue
         
@@ -666,24 +802,34 @@ class EnhancedPrivBayesAdapter:
         try:
             dt = pd.to_datetime(date_str, errors='coerce')
             if pd.notna(dt):
+                # Check if time component is all zeros (date-only)
+                time_part = dt.time()
+                is_date_only = (time_part.hour == 0 and time_part.minute == 0 and 
+                               time_part.second == 0 and time_part.microsecond == 0)
+                
                 # Try common formats
-                common_formats = [
-                    '%Y-%m-%d %H:%M:%S.%f',  # 2019-10-01 00:00:00.000
-                    '%Y-%m-%d %H:%M:%S',     # 2019-10-01 00:00:00
-                    '%Y-%m-%dT%H:%M:%S.%f',  # 2019-10-01T00:00:00.000
-                    '%Y-%m-%dT%H:%M:%S',     # 2019-10-01T00:00:00
-                    '%Y-%m-%d',              # 2019-10-01
-                ]
+                if is_date_only:
+                    common_formats = [
+                        '%Y-%m-%d',  # 2019-10-01
+                    ]
+                else:
+                    common_formats = [
+                        '%Y-%m-%d %H:%M:%S.%f',  # 2019-10-01 00:00:00.000
+                        '%Y-%m-%d %H:%M:%S',     # 2019-10-01 00:00:00
+                        '%Y-%m-%dT%H:%M:%S.%f',  # 2019-10-01T00:00:00.000
+                        '%Y-%m-%dT%H:%M:%S',     # 2019-10-01T00:00:00
+                    ]
+                
                 for fmt in common_formats:
                     try:
                         parsed = datetime.strptime(date_str, fmt)
                         if parsed == dt.to_pydatetime():
-                            return fmt
+                            return fmt, is_date_only
                     except ValueError:
                         continue
         except Exception:
             pass
         
-        return None
+        return None, False
 
 
